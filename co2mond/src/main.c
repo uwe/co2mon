@@ -31,6 +31,8 @@
 
 #include "co2mon.h"
 
+#include "influxdb.h"
+
 #define CODE_TAMB 0x42 /* Ambient Temperature */
 #define CODE_CNTR 0x50 /* Relative Concentration of CO2 */
 
@@ -41,6 +43,9 @@ int daemonize = 0;
 int print_unknown = 0;
 const char *devicefile = NULL;
 char *datadir;
+
+char *influx_db = 0;
+influx_client_t influx;
 
 uint16_t co2mon_data[256];
 
@@ -118,6 +123,38 @@ write_value(const char *name, const char *value)
     return result;
 }
 
+static int
+write_temperature_influx(const char *value)
+{
+    long long timestamp;
+    timestamp = (long long)time(0);
+    timestamp *= 1000000000;
+
+    post_http(
+        &influx,
+        INFLUX_MEAS("temp"),
+        INFLUX_F_FLT("value", atof(value), 4),
+        INFLUX_TS(timestamp),
+        INFLUX_END
+    );
+}
+
+static int
+write_co2_influx(const char *value)
+{
+    long long timestamp;
+    timestamp = (long long)time(0);
+    timestamp *= 1000000000;
+
+    post_http(
+        &influx,
+        INFLUX_MEAS("co2"),
+        INFLUX_F_INT("value", atoi(value)),
+        INFLUX_TS(timestamp),
+        INFLUX_END
+    );
+}
+
 static void
 write_heartbeat()
 {
@@ -181,13 +218,29 @@ device_loop(co2mon_device dev)
 
             if (co2mon_data[r0] != w)
             {
-                if (write_value("Tamb", buf))
+                if (influx_db)
                 {
-                    co2mon_data[r0] = w;
+                    if (write_temperature_influx(buf))
+                    {
+                        co2mon_data[r0] = w;
+                    }
+                    else
+                    {
+                        /* TODO: write to spool file */
+                    }
+                }
+                else {
+                    if (write_value("Tamb", buf))
+                    {
+                        co2mon_data[r0] = w;
+                    }
                 }
             }
 
-            write_heartbeat();
+            if (!influx_db)
+            {
+                write_heartbeat();
+            }
 
             break;
         case CODE_CNTR:
@@ -205,13 +258,30 @@ device_loop(co2mon_device dev)
 
             if (co2mon_data[r0] != w)
             {
-                if (write_value("CntR", buf))
+                if (influx_db)
                 {
-                    co2mon_data[r0] = w;
+                    if (write_co2_influx(buf))
+                    {
+                        co2mon_data[r0] = w;
+                    }
+                    else
+                    {
+                        /* TODO: write to spool file */
+                    }
+                }
+                else
+                {
+                    if (write_value("CntR", buf))
+                    {
+                        co2mon_data[r0] = w;
+                    }
                 }
             }
 
-            write_heartbeat();
+            if (!influx_db)
+            {
+                write_heartbeat();
+            }
 
             break;
         default:
@@ -269,10 +339,15 @@ int main(int argc, char *argv[])
     char *pidfile = 0;
     char *logfile = 0;
 
+    char *influx_host = 0;
+    char *influx_port = 0;
+    char *influx_usr = 0;
+    char *influx_pwd = 0;
+
     int c;
     int opterr = 0;
     int show_help = 0;
-    while ((c = getopt(argc, argv, ":dhuD:f:l:p:")) != -1)
+    while ((c = getopt(argc, argv, ":dhuD:f:l:p:H:P:B:U:W:")) != -1)
     {
         switch (c)
         {
@@ -296,6 +371,21 @@ int main(int argc, char *argv[])
             break;
         case 'p':
             pidfile = optarg;
+            break;
+        case 'H':
+            influx_host = optarg;
+            break;
+        case 'P':
+            influx_port = optarg;
+            break;
+        case 'B':
+            influx_db = optarg;
+            break;
+        case 'U':
+            influx_usr = optarg;
+            break;
+        case 'W':
+            influx_pwd = optarg;
             break;
         case ':':
             fprintf(stderr, "Option -%c requires an operand\n", optopt);
@@ -327,13 +417,25 @@ int main(int argc, char *argv[])
             fprintf(stderr, "        write PID to a file named pidfile\n");
             fprintf(stderr, "  -l logfile\n");
             fprintf(stderr, "        write diagnostic information to a file named logfile\n");
+
+            fprintf(stderr, "  -H hostname\n");
+            fprintf(stderr, "        InfluxDB hostname (default: influxdb)\n");
+            fprintf(stderr, "  -P port\n");
+            fprintf(stderr, "        InfluxDB port (default: 8086)\n");
+            fprintf(stderr, "  -B database\n");
+            fprintf(stderr, "        InfluxDB database (needed to turn on InfluxDB delivery)\n");
+            fprintf(stderr, "  -U username\n");
+            fprintf(stderr, "        InfluxDB username (optional)\n");
+            fprintf(stderr, "  -W password\n");
+            fprintf(stderr, "        InfluxDB password (optional)\n");
+
             fprintf(stderr, "\n");
         }
         exit(1);
     }
-    if (daemonize && !reldatadir)
+    if (daemonize && !(reldatadir || influx_db))
     {
-        fprintf(stderr, "co2mond: it is useless to use -d without -D.\n");
+        fprintf(stderr, "co2mond: it is useless to use -d without -D or -B.\n");
         exit(1);
     }
 
@@ -366,6 +468,39 @@ int main(int argc, char *argv[])
         {
             perror(logfile);
             exit(1);
+        }
+    }
+
+    if (influx_db)
+    {
+        if (influx_host)
+        {
+            influx.host = strdup(influx_host);
+        }
+        else
+        {
+            influx.host = strdup("influxdb");
+        }
+
+        if (influx_port)
+        {
+            influx.port = atoi(influx_port);
+        }
+        else
+        {
+            influx.port = 8086;
+        }
+
+        influx.db = strdup(influx_db);
+
+        if (influx_usr)
+        {
+            influx.usr = strdup(influx_usr);
+        }
+
+        if (influx_pwd)
+        {
+            influx.pwd = strdup(influx_pwd);
         }
     }
 
